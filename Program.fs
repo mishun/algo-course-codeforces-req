@@ -3,18 +3,17 @@ module Main
 open System
 open System.Collections.Generic
 open System.CommandLine
+open System.Diagnostics
 open System.IO
 open System.Net.Http
 open System.Text
 open System.Text.Json
-open System.Text.Json.Serialization
 open System.Threading.Tasks
-open YamlDotNet.Serialization
-open YamlDotNet.Serialization.NamingConventions
 
 
 module CodeforcesApi =
     open System.Security.Cryptography
+    open System.Text.Json.Serialization
 
 
     let baseUri = Uri "https://codeforces.com/api/"
@@ -97,17 +96,31 @@ module CodeforcesApi =
 let downloadData dataDirPath creds (contestIdList : string seq) = task {
     let now = DateTime.UtcNow
     let timeThresh = TimeSpan.FromMinutes 10.0
-    use httpClient = new HttpClient(BaseAddress = CodeforcesApi.baseUri)
+
+    let queue = Queue()
     for contestId in contestIdList do
         let jsonFilePath = Path.Combine(dataDirPath, $"{contestId}.json")
         if File.Exists jsonFilePath && now - File.GetLastWriteTimeUtc jsonFilePath < timeThresh then
-            Console.Error.WriteLine $"Existing file for {contestId} is less than {timeThresh} old, skipping"
+            Console.Error.WriteLine $"Existing file for '\x1B[33;1m{contestId}\x1B[0m' is less than {timeThresh} old, skipping"
         else
-            Console.Error.WriteLine $"Attempting to download {contestId}..."
+            struct (contestId, jsonFilePath) |> queue.Enqueue
+
+    if queue.Count > 0 then
+        use httpClient = new HttpClient(BaseAddress = CodeforcesApi.baseUri)
+        while queue.Count > 0 do
+            let struct (contestId, jsonFilePath) = queue.Dequeue()
+            Console.Error.WriteLine $"Attempting to download '\x1B[33;1m{contestId}\x1B[0m'..."
+
+            let stopwatch = Stopwatch.StartNew()
             let! json = CodeforcesApi.downloadStandings httpClient creds contestId
-            Console.Error.WriteLine $"Done {contestId}"
+            stopwatch.Stop()
+            Console.Error.WriteLine $"\x1B[32;1mDone '{contestId}' in {stopwatch.ElapsedMilliseconds}ms\x1B[0m"
+
             do! File.WriteAllTextAsync(jsonFilePath, json)
-            do! Task.Delay 2000
+            if queue.Count > 0 then
+                let delay = 2000
+                Console.Error.WriteLine $"Waiting for {delay}ms to meet codeforces throttling requirement..."
+                do! Task.Delay delay
 }
 
 
@@ -120,6 +133,14 @@ let readData dataDirPath (contestIdList : string seq) = task {
         data.Add result.Result
     return data
 }
+
+
+let validateData (contests : CodeforcesApi.StandingsResult seq) =
+    let printError (msg : string) = Console.Error.WriteLine $"\x1B[31;1m{msg}\x1B[0m"
+    for contest in contests do
+        for problem in contest.Problems do
+            if not (problem.Index.EndsWith ".1" || problem.Index.EndsWith ".2" || problem.Index.EndsWith ".3") then
+                printError $"At '{contest.Contest.Id}/{problem.Index}': problem index is supposed to end with '.1', '.2' or '.3'"
 
 
 let formatCell (absRow : bool) row col =
@@ -146,10 +167,10 @@ let formatTotalScoreExpr (baseCol : int) (row : int) (contests : CodeforcesApi.S
     let mutable currentCol = baseCol
     for i, (contest: CodeforcesApi.StandingsResult) in Seq.indexed contests do
         currentCol <- currentCol + 2 + contest.Problems.Length
-        totalScoreExpr.Append(if i > 0 then ", " else "=SUM(") |> ignore
-        totalScoreExpr.Append(formatCell false row currentCol) |> ignore
-    totalScoreExpr.Append(if totalScoreExpr.Length > 0 then ")" else "0") |> ignore
-    totalScoreExpr.ToString()
+        totalScoreExpr
+            .Append(if i > 0 then ", " else "=SUM(")
+            .Append(formatCell false row currentCol) |> ignore
+    totalScoreExpr.Append(if totalScoreExpr.Length > 0 then ")" else "0").ToString()
 
 
 let formatScoreExpr col row len =
@@ -157,7 +178,7 @@ let formatScoreExpr col row len =
         "=0"
     else
         let range = $"{formatCell false row col}:{formatCell false row (col + len - 1)}"
-        $"=COUNTIF({range}, \"+\")+COUNTIF({range}, \"±\")"
+        $"=COUNTIF({range}, \"+\")+COUNTIF({range}, \"±\")-COUNTIF({range}, \"!\")"
 
 
 let formatHeader baseCol baseRow (contests : CodeforcesApi.StandingsResult seq) =
@@ -176,33 +197,72 @@ let formatHeader baseCol baseRow (contests : CodeforcesApi.StandingsResult seq) 
     $"{l1}\n{l2}"
 
 
-let formatLine baseCol baseRow (lineIndex : int) (contestantId : string) (contests : CodeforcesApi.StandingsResult seq) =
+[<Struct; RequireQualifiedAccess>]
+type Marker =
+    | Tainted | Clear | Attempted | Ok | OkLate
+with
+    member marker.Rendered =
+        match marker with
+        | Ok -> "'+"
+        | Tainted -> "'!"
+        | OkLate -> "'±"
+        | Attempted -> "'-"
+        | Clear -> ""
+
+    member marker.Priority =
+        match marker with
+        | Tainted -> 1000
+        | Ok -> 100
+        | OkLate -> 50
+        | Attempted -> 10
+        | Clear -> 0
+
+    static member UpdateWith (marker : byref<Marker>, res : CodeforcesApi.ProblemResult, late : bool) =
+        let proposed =
+            match late with
+            | false when res.Points > 0.0 -> Ok
+            | true when res.Points > 0.0 -> OkLate
+            | _ when res.RejectedAttemptCount > 0 -> Attempted
+            | _ -> Clear
+
+        if proposed.Priority > marker.Priority then
+            marker <- proposed
+
+    static member Initial (tainted : bool) =
+        if tainted then Tainted else Clear
+
+
+let formatLine baseCol baseRow (lineIndex : int) (contestantId : string) (contests : CodeforcesApi.StandingsResult seq) (taintedProblems : HashSet<string>) =
     let tableRow = baseRow + 2 + lineIndex
+
+    let isUpsolvable (problem : CodeforcesApi.Problem) =
+        problem.Index.EndsWith ".1" |> not
 
     let sb = StringBuilder()
     let mutable currentCol = baseCol + 2
     for contest in contests do
-        let markers = contest.Problems |> Array.map (fun _ -> 0)
+        let markers = [|
+            for p in contest.Problems ->
+                Marker.Initial(taintedProblems.Contains $"{contest.Contest.Id}/{p.Index}")
+        |]
 
         for ranklistRow in contest.Rows do
             if ranklistRow.Party.Members.Length = 1 && ranklistRow.Party.Members.[0].Handle = contestantId then
-                let partType = ranklistRow.Party.ParticipantType
-                for index, result in Seq.indexed ranklistRow.ProblemResults do
-                    let problem = contest.Problems.[index]
-                    if result.Points > 0.0 then
-                        if partType = CodeforcesApi.ParticipantType.CONTESTANT then
-                            markers.[index] <- 1
-                        elif partType = CodeforcesApi.ParticipantType.PRACTICE && not (problem.Index.EndsWith ".1") && markers.[index] = 0 then
-                            markers.[index] <- 2
+                match ranklistRow.Party.ParticipantType with
+                | CodeforcesApi.ParticipantType.CONTESTANT ->
+                    for index, result in Seq.indexed ranklistRow.ProblemResults do
+                        Marker.UpdateWith(&markers.[index], result, false)
+
+                | CodeforcesApi.ParticipantType.PRACTICE ->
+                    for index, result in Seq.indexed ranklistRow.ProblemResults do
+                        if isUpsolvable contest.Problems.[index] then
+                            Marker.UpdateWith(&markers.[index], result, true)
+
+                | _ -> ()
 
         sb.Append "\t" |> ignore
-        for value in markers do
-            let marker =
-                match value with
-                | 1 -> "'+"
-                | 2 -> "'±"
-                | _ -> ""
-            sb.Append $"\t{marker}" |> ignore
+        for marker in markers do
+            sb.Append("\t").Append(marker.Rendered) |> ignore
 
         sb.Append $"\t{formatScoreExpr (currentCol + 2) tableRow contest.Problems.Length}" |> ignore
         currentCol <- currentCol + 2 + contest.Problems.Length
@@ -212,34 +272,72 @@ let formatLine baseCol baseRow (lineIndex : int) (contestantId : string) (contes
     $"{contestantId}\t{ratioExpr}\t{totalScoreExpr}{sb}"
 
 
-type ScriptConfig () =
-    [<YamlMember(Alias = "contestants")>]
-    member val ContestantIdList : string[] = null with get, set
+let prapareCopypastes (listOfAllContestants : string[]) (contests : CodeforcesApi.StandingsResult seq) (copypastes : IDictionary<string, string[]>) =
+    let contestantLookup = HashSet listOfAllContestants
+    let problemCodeLookup =
+        HashSet (seq {
+            for c in contests do
+                for p in c.Problems do
+                    yield $"{c.Contest.Id}/{p.Index}"
+        })
 
-    [<YamlMember(Alias = "contests")>]
-    member val ContestIdList : string[] = null with get, set
+    let problemsByContestant = readOnlyDict (seq { for id in listOfAllContestants -> (id, HashSet<string>()) })
+    if copypastes <> null then
+        let printError (msg : string) = Console.Error.WriteLine $"\x1B[31;1m{msg}\x1B[0m"
+        for KeyValue(problemCode, listedContestants) in copypastes do
+            if String.IsNullOrWhiteSpace problemCode then
+                printError "Key is null or empty"
+            elif problemCodeLookup.Contains problemCode then
+                if listedContestants = null then
+                    printError $"at '{problemCode}': contestant list is null"
+                else
+                    for contestantId in listedContestants do
+                        if contestantLookup.Contains contestantId then
+                            problemsByContestant.[contestantId].Add problemCode |> ignore
+                        else
+                            printError $"at '{problemCode}': '{contestantId}' is not a valid contestant"
+            else
+                printError $"'{problemCode}' is not valid problem code"
 
-    [<YamlMember(Alias = "apikey")>]
-    member val ApiKey = "" with get, set
-
-    [<YamlMember(Alias = "apisecret")>]
-    member val ApiSecret = "" with get, set
+    problemsByContestant
 
 
-let readConfig (configPath : string) = task {
-    let! text = File.ReadAllTextAsync configPath
-    let deserializer =
-        DeserializerBuilder()
-            .IgnoreFields()
-            .WithNamingConvention(CamelCaseNamingConvention.Instance)
-            .Build()
-    let cfg = deserializer.Deserialize<ScriptConfig> text
-    return cfg
-}
+module Config =
+    open YamlDotNet.Serialization
+    open YamlDotNet.Serialization.NamingConventions
+
+
+    type ScriptConfig () =
+        [<YamlMember(Alias = "contestants")>]
+        member val ContestantIdList : string[] = null with get, set
+
+        [<YamlMember(Alias = "contests")>]
+        member val ContestIdList : string[] = null with get, set
+
+        [<YamlMember(Alias = "apikey")>]
+        member val ApiKey = "" with get, set
+
+        [<YamlMember(Alias = "apisecret")>]
+        member val ApiSecret = "" with get, set
+
+        [<YamlMember(Alias = "copypaste")>]
+        member val Copypastes : IDictionary<string, string[]> = null with get, set
+
+
+    let read (path : string) = task {
+        let! text = File.ReadAllTextAsync path
+        let deserializer =
+            DeserializerBuilder()
+                .IgnoreFields()
+                .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                .Build()
+        let cfg = deserializer.Deserialize<ScriptConfig> text
+        return cfg
+    }
 
 
 let handleDownload (configPath : string) (dataDirPath : string) : Task = task {
-    let! cfg = readConfig configPath
+    let! cfg = Config.read configPath
 
     Directory.CreateDirectory(dataDirPath) |> ignore
     do! downloadData dataDirPath { ApiKey = cfg.ApiKey ; ApiSecret = cfg.ApiSecret } cfg.ContestIdList
@@ -247,19 +345,41 @@ let handleDownload (configPath : string) (dataDirPath : string) : Task = task {
 
 
 let handleFormat (configPath : string) (dataDirPath : string) : Task = task {
-    let! cfg = readConfig configPath
-    let! data = readData dataDirPath cfg.ContestIdList
+    let! cfg = Config.read configPath
+    let resultPath = "result.txt"
+
+    let! contests = readData dataDirPath cfg.ContestIdList
+    validateData contests
+    let copypastes = prapareCopypastes cfg.ContestantIdList contests cfg.Copypastes
 
     let baseRow = 0
     let baseCol = 2
-    use writer = File.CreateText "result.txt"
-    do! writer.WriteLineAsync(formatHeader baseCol baseRow data)
+
+    use writer = File.CreateText resultPath
+    do! writer.WriteLineAsync(formatHeader baseCol baseRow contests)
     for index, contestantId in Seq.indexed cfg.ContestantIdList do
-        do! writer.WriteLineAsync(formatLine baseCol baseRow index contestantId data)
+        let tableLine = formatLine baseCol baseRow index contestantId contests copypastes.[contestantId]
+        do! writer.WriteLineAsync tableLine
+    Console.Error.WriteLine $"Table is written to '{resultPath}'"
 }
 
 
-let asyncMain (args : string[]) = task {
+let handleDraftCopypaste (configPath : string) (dataDirPath : string) : Task = task {
+    let! cfg = Config.read configPath
+    let resultPath = "copypaste-draft.md"
+
+    let! contests = readData dataDirPath cfg.ContestIdList
+    use writer = File.CreateText resultPath
+    for contest in contests do
+        do! writer.WriteLineAsync $"# Contest {contest.Contest.Id} ({contest.Contest.Name})"
+        for problem in contest.Problems do
+            do! writer.WriteLineAsync $"## Problem {contest.Contest.Id}/{problem.Index} ({problem.Name})"
+            do! writer.WriteLineAsync()
+        do! writer.WriteLineAsync()
+}
+
+
+let prepareRootCommand () =
     let configPathOption = Option<string>("--config", "Path to YAML config", IsRequired = false)
     configPathOption.SetDefaultValue "config.yaml"
 
@@ -272,16 +392,15 @@ let asyncMain (args : string[]) = task {
     let formatCommand = Command("format", "Format result.txt from downloaded JSONs")
     formatCommand.SetHandler(handleFormat, configPathOption, dataDirPathOption)
 
-    let rootCommand = RootCommand()
-    rootCommand.AddGlobalOption configPathOption
-    rootCommand.AddGlobalOption dataDirPathOption
-    rootCommand.Add downloadCommand
-    rootCommand.Add formatCommand
+    let draftCopypaste = Command("draft-copypaste", "Create draft for copypaste.md")
+    draftCopypaste.SetHandler(handleDraftCopypaste, configPathOption, dataDirPathOption)
 
-    return! rootCommand.InvokeAsync(args)
-}
+    let rootCommand = RootCommand()
+    seq { configPathOption ; dataDirPathOption } |> Seq.iter rootCommand.AddGlobalOption
+    seq { downloadCommand ; formatCommand ; draftCopypaste } |> Seq.iter rootCommand.Add
+    rootCommand
 
 
 [<EntryPoint>]
 let main args =
-    asyncMain(args).GetAwaiter().GetResult()
+    prepareRootCommand().InvokeAsync(args).GetAwaiter().GetResult()
