@@ -40,9 +40,8 @@ module CodeforcesApi =
         return! httpResponse.EnsureSuccessStatusCode().Content.ReadAsStringAsync()
     }
 
-    type Member = {
+    type PartyMember = {
         [<JsonPropertyName "handle">] Handle : string
-        [<JsonPropertyName "name">] Name : string
     }
 
     [<JsonConverter(typeof<JsonStringEnumConverter>)>]
@@ -54,8 +53,9 @@ module CodeforcesApi =
         | OUT_OF_COMPETITION = 5
 
     type Party = {
-        [<JsonPropertyName "members">] Members : Member[]
+        [<JsonPropertyName "members">] Members : PartyMember[]
         [<JsonPropertyName "participantType">] ParticipantType : ParticipantType
+        [<JsonPropertyName "ghost">] IsGhost : bool
     }
 
     type ProblemResult = {
@@ -135,12 +135,65 @@ let readData dataDirPath (contestIdList : string seq) = task {
 }
 
 
-let validateData (contests : CodeforcesApi.StandingsResult seq) =
-    let printError (msg : string) = Console.Error.WriteLine $"\x1B[31;1m{msg}\x1B[0m"
+let printError (msg : string) =
+    Console.Error.WriteLine $"\x1B[31;1m{msg}\x1B[0m"
+
+
+let printWarn (msg : string) =
+    Console.Error.WriteLine $"\x1B[33;1m{msg}\x1B[0m"
+
+
+let printInfo (msg : string) =
+    Console.Error.WriteLine msg
+
+
+let validateData (listOfAllContestants : string[]) (contests : CodeforcesApi.StandingsResult seq) =
+    let contestantLookup = HashSet listOfAllContestants
+
+    let mutable totalNumberOfProblems = 0
     for contest in contests do
-        for problem in contest.Problems do
+        let isUntested = Array.create contest.Problems.Length true
+        for rowIndex, row in Seq.indexed contest.Rows do
+            let msgPrefix =
+                lazy
+                    let sb = StringBuilder $"At '{contest.Contest.Id}'/row#{rowIndex:D3} {{"
+                    if row.Party.Members <> null then
+                        let mutable first = true
+                        for m in row.Party.Members do
+                            sb.Append(if first then "" else ", ").Append(m.Handle) |> ignore
+                            first <- false
+                    sb.Append("}:") |> ignore
+                    sb.ToString()
+
+            if row.Party.IsGhost then
+                printError $"{msgPrefix.Value} is a ghost"
+
+            if row.ProblemResults.Length <> contest.Problems.Length then
+                printError $"{msgPrefix.Value} number of problem results ({row.ProblemResults.Length}) doesn't match number of problems in contest ({contest.Problems.Length})"
+
+            match row.Party.ParticipantType with
+            | CodeforcesApi.ParticipantType.VIRTUAL -> printWarn $"{msgPrefix.Value} virtual participant; contest config is wrong?"
+            | CodeforcesApi.ParticipantType.OUT_OF_COMPETITION -> printWarn $"{msgPrefix.Value} out-of-competition participant"
+            | CodeforcesApi.ParticipantType.MANAGER ->
+                for problemIndex, res in Seq.indexed row.ProblemResults do
+                    if res.Points > 0.0 then
+                        isUntested.[problemIndex] <- false
+            | _ ->
+                if row.Party.Members.Length <> 1 then
+                    printWarn $"{msgPrefix.Value} isn't single participant"
+                elif not (contestantLookup.Contains row.Party.Members.[0].Handle) then
+                    printWarn $"{msgPrefix.Value} isn't in list of contestants"
+
+        for problemIndex, problem in Seq.indexed contest.Problems do
+            let msgPrefix = lazy $"At '{contest.Contest.Id}/{problem.Index}':"
+
+            totalNumberOfProblems <- totalNumberOfProblems + 1
             if not (problem.Index.EndsWith ".1" || problem.Index.EndsWith ".2" || problem.Index.EndsWith ".3") then
-                printError $"At '{contest.Contest.Id}/{problem.Index}': problem index is supposed to end with '.1', '.2' or '.3'"
+                printError $"{msgPrefix.Value} problem index is supposed to end with '.1', '.2' or '.3'"
+            if isUntested.[problemIndex] then
+                printWarn $"{msgPrefix.Value} problem isn't tested by contest manager"
+
+    printInfo $"{totalNumberOfProblems} problems total"
 
 
 let formatCell (absRow : bool) row col =
@@ -240,6 +293,8 @@ let formatLine baseCol baseRow (lineIndex : int) (contestantId : string) (contes
 
     let sb = StringBuilder()
     let mutable currentCol = baseCol + 2
+    let mutable problemsAvailable = 0
+    let mutable problemsScored = 0
     for contest in contests do
         let markers = [|
             for p in contest.Problems ->
@@ -263,9 +318,13 @@ let formatLine baseCol baseRow (lineIndex : int) (contestantId : string) (contes
         sb.Append "\t" |> ignore
         for marker in markers do
             sb.Append("\t").Append(marker.Rendered) |> ignore
+            problemsAvailable <- problemsAvailable + (match marker with | Marker.Clear | Marker.Attempted -> 1 | _ -> 0)
+            problemsScored <- problemsScored + (match marker with | Marker.Ok | Marker.OkLate -> 1 | Marker.Tainted -> -1 | _ -> 0)
 
         sb.Append $"\t{formatScoreExpr (currentCol + 2) tableRow contest.Problems.Length}" |> ignore
         currentCol <- currentCol + 2 + contest.Problems.Length
+
+    printInfo $"{contestantId} scored {problemsScored} has {problemsAvailable} problems available"
 
     let ratioExpr = $"={formatCell false tableRow (baseCol + 2)}/{formatCell true (baseRow + 1) (baseCol + 2)}"
     let totalScoreExpr = formatTotalScoreExpr (baseCol + 2) tableRow contests
@@ -283,7 +342,6 @@ let prapareCopypastes (listOfAllContestants : string[]) (contests : CodeforcesAp
 
     let problemsByContestant = readOnlyDict (seq { for id in listOfAllContestants -> (id, HashSet<string>()) })
     if copypastes <> null then
-        let printError (msg : string) = Console.Error.WriteLine $"\x1B[31;1m{msg}\x1B[0m"
         for KeyValue(problemCode, listedContestants) in copypastes do
             if String.IsNullOrWhiteSpace problemCode then
                 printError "Key is null or empty"
@@ -349,7 +407,7 @@ let handleFormat (configPath : string) (dataDirPath : string) : Task = task {
     let resultPath = "result.txt"
 
     let! contests = readData dataDirPath cfg.ContestIdList
-    validateData contests
+    validateData cfg.ContestantIdList contests
     let copypastes = prapareCopypastes cfg.ContestantIdList contests cfg.Copypastes
 
     let baseRow = 0
@@ -360,7 +418,7 @@ let handleFormat (configPath : string) (dataDirPath : string) : Task = task {
     for index, contestantId in Seq.indexed cfg.ContestantIdList do
         let tableLine = formatLine baseCol baseRow index contestantId contests copypastes.[contestantId]
         do! writer.WriteLineAsync tableLine
-    Console.Error.WriteLine $"Table is written to '{resultPath}'"
+    printInfo $"Table is written to '{resultPath}'"
 }
 
 
