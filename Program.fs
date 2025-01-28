@@ -196,6 +196,13 @@ let validateData (listOfAllContestants : string[]) (contests : CodeforcesApi.Sta
     printInfo $"{totalNumberOfProblems} problems total"
 
 
+type Context = {
+    BaseRow : int
+    BaseCol : int
+    CopypasteScore : float
+}
+
+
 let formatCell (absRow : bool) row col =
     let digits = List<_>()
     digits.Add(col % 26)
@@ -226,17 +233,17 @@ let formatTotalScoreExpr (baseCol : int) (row : int) (contests : CodeforcesApi.S
     totalScoreExpr.Append(if totalScoreExpr.Length > 0 then ")" else "0").ToString()
 
 
-let formatScoreExpr col row len =
+let formatScoreExpr (ctx : Context) col row len =
     if len < 1 then
         "=0"
     else
         let range = $"{formatCell false row col}:{formatCell false row (col + len - 1)}"
-        $"=COUNTIF({range}, \"+\")+COUNTIF({range}, \"±\")-COUNTIF({range}, \"!\")"
+        $"=COUNTIF({range}, \"+\")+COUNTIF({range}, \"±\")+({ctx.CopypasteScore})*COUNTIF({range}, \"!\")"
 
 
-let formatHeader baseCol baseRow (contests : CodeforcesApi.StandingsResult seq) =
+let formatHeader (ctx : Context) (contests : CodeforcesApi.StandingsResult seq) =
     let l1 = StringBuilder "codeforces id\tratio\t∑"
-    let l2 = StringBuilder $"\t=1\t{formatTotalScoreExpr (baseCol + 2) (baseRow + 1) contests}"
+    let l2 = StringBuilder $"\t=1\t{formatTotalScoreExpr (ctx.BaseCol + 2) (ctx.BaseRow + 1) contests}"
     for contest in contests do
         l1.Append "\t" |> ignore
         l2.Append "\t" |> ignore
@@ -285,14 +292,14 @@ with
         if tainted then Tainted else Clear
 
 
-let formatLine baseCol baseRow (lineIndex : int) (contestantId : string) (contests : CodeforcesApi.StandingsResult seq) (taintedProblems : HashSet<string>) =
-    let tableRow = baseRow + 2 + lineIndex
+let formatLine (ctx : Context) (lineIndex : int) (contestantId : string) (contests : CodeforcesApi.StandingsResult seq) (taintedProblems : HashSet<string>) =
+    let tableRow = ctx.BaseRow + 2 + lineIndex
 
     let isUpsolvable (problem : CodeforcesApi.Problem) =
         problem.Index.EndsWith ".1" |> not
 
     let sb = StringBuilder()
-    let mutable currentCol = baseCol + 2
+    let mutable currentCol = ctx.BaseCol + 2
     let mutable problemsAvailable = 0
     let mutable problemsScored = 0
     for contest in contests do
@@ -321,13 +328,13 @@ let formatLine baseCol baseRow (lineIndex : int) (contestantId : string) (contes
             problemsAvailable <- problemsAvailable + (match marker with | Marker.Clear | Marker.Attempted -> 1 | _ -> 0)
             problemsScored <- problemsScored + (match marker with | Marker.Ok | Marker.OkLate -> 1 | Marker.Tainted -> -1 | _ -> 0)
 
-        sb.Append $"\t{formatScoreExpr (currentCol + 2) tableRow contest.Problems.Length}" |> ignore
+        sb.Append $"\t{formatScoreExpr ctx (currentCol + 2) tableRow contest.Problems.Length}" |> ignore
         currentCol <- currentCol + 2 + contest.Problems.Length
 
     printInfo $"{contestantId} scored {problemsScored} has {problemsAvailable} problems available"
 
-    let ratioExpr = $"={formatCell false tableRow (baseCol + 2)}/{formatCell true (baseRow + 1) (baseCol + 2)}"
-    let totalScoreExpr = formatTotalScoreExpr (baseCol + 2) tableRow contests
+    let ratioExpr = $"={formatCell false tableRow (ctx.BaseCol + 2)}/{formatCell true (ctx.BaseRow + 1) (ctx.BaseCol + 2)}"
+    let totalScoreExpr = formatTotalScoreExpr (ctx.BaseCol + 2) tableRow contests
     $"{contestantId}\t{ratioExpr}\t{totalScoreExpr}{sb}"
 
 
@@ -362,7 +369,6 @@ let prapareCopypastes (listOfAllContestants : string[]) (contests : CodeforcesAp
 
 module Config =
     open YamlDotNet.Serialization
-    open YamlDotNet.Serialization.NamingConventions
 
 
     type ScriptConfig () =
@@ -381,14 +387,14 @@ module Config =
         [<YamlMember(Alias = "copypaste")>]
         member val Copypastes : IDictionary<string, string[]> = null with get, set
 
+        [<YamlMember(Alias = "copypaste-score")>]
+        member val CopypasteScore : Nullable<float> = Nullable() with get, set
+
 
     let read (path : string) = task {
         let! text = File.ReadAllTextAsync path
         let deserializer =
-            DeserializerBuilder()
-                .IgnoreFields()
-                .WithNamingConvention(CamelCaseNamingConvention.Instance)
-                .Build()
+            DeserializerBuilder().IgnoreFields().Build()
         let cfg = deserializer.Deserialize<ScriptConfig> text
         return cfg
     }
@@ -402,21 +408,23 @@ let handleDownload (configPath : string) (dataDirPath : string) : Task = task {
 }
 
 
-let handleFormat (configPath : string) (dataDirPath : string) : Task = task {
+let handleFormat (configPath : string) (dataDirPath : string) (resultPath : string) : Task = task {
     let! cfg = Config.read configPath
-    let resultPath = "result.txt"
 
     let! contests = readData dataDirPath cfg.ContestIdList
     validateData cfg.ContestantIdList contests
     let copypastes = prapareCopypastes cfg.ContestantIdList contests cfg.Copypastes
 
-    let baseRow = 0
-    let baseCol = 2
+    let ctx = {
+        BaseRow = 0
+        BaseCol = 2
+        CopypasteScore = cfg.CopypasteScore.GetValueOrDefault -1.0
+    }
 
     use writer = File.CreateText resultPath
-    do! writer.WriteLineAsync(formatHeader baseCol baseRow contests)
+    do! writer.WriteLineAsync(formatHeader ctx contests)
     for index, contestantId in Seq.indexed cfg.ContestantIdList do
-        let tableLine = formatLine baseCol baseRow index contestantId contests copypastes.[contestantId]
+        let tableLine = formatLine ctx index contestantId contests copypastes.[contestantId]
         do! writer.WriteLineAsync tableLine
     printInfo $"Table is written to '{resultPath}'"
 }
@@ -444,11 +452,15 @@ let prepareRootCommand () =
     let dataDirPathOption = new Option<string>("--data-dir", "JSONs directory", IsRequired = false)
     dataDirPathOption.SetDefaultValue "data"
 
+    let resultPathOption = Option<string>("--result", "Path to result file", IsRequired = false)
+    resultPathOption.SetDefaultValue "result.txt"
+
     let downloadCommand = Command("download", "Download standings JSONs")
     downloadCommand.SetHandler(handleDownload, configPathOption, dataDirPathOption)
 
-    let formatCommand = Command("format", "Format result.txt from downloaded JSONs")
-    formatCommand.SetHandler(handleFormat, configPathOption, dataDirPathOption)
+    let formatCommand = Command("format", "Format result from downloaded JSONs")
+    formatCommand.AddOption resultPathOption
+    formatCommand.SetHandler(handleFormat, configPathOption, dataDirPathOption, resultPathOption)
 
     let draftCopypaste = Command("draft-copypaste", "Create draft for copypaste.md")
     draftCopypaste.SetHandler(handleDraftCopypaste, configPathOption, dataDirPathOption)
