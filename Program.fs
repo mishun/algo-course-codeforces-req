@@ -368,48 +368,78 @@ let prapareCopypastes (listOfAllContestants : string[]) (contests : CodeforcesAp
 
 
 module Config =
+    open YamlDotNet.Core
+    open YamlDotNet.Core.Events
     open YamlDotNet.Serialization
 
+    [<CLIMutable>]
+    type Secret = {
+        [<YamlMember(Alias = "codeforces-api-key")>]
+        CodeforcesApiKey : string
 
-    type ScriptConfig () =
+        [<YamlMember(Alias = "codeforces-api-secret")>]
+        CodeforcesApiSecret : string
+    }
+
+    [<CLIMutable>]
+    type ContestConfig = {
+        [<YamlMember(Alias = "id")>]
+        TableId : string
+
         [<YamlMember(Alias = "contestants")>]
-        member val ContestantIdList : string[] = null with get, set
+        ContestantIdList : string[]
 
         [<YamlMember(Alias = "contests")>]
-        member val ContestIdList : string[] = null with get, set
-
-        [<YamlMember(Alias = "apikey")>]
-        member val ApiKey = "" with get, set
-
-        [<YamlMember(Alias = "apisecret")>]
-        member val ApiSecret = "" with get, set
+        ContestIdList : string[]
 
         [<YamlMember(Alias = "copypaste")>]
-        member val Copypastes : IDictionary<string, string[]> = null with get, set
+        Copypastes : IDictionary<string, string[]>
 
         [<YamlMember(Alias = "copypaste-score")>]
-        member val CopypasteScore : Nullable<float> = Nullable() with get, set
-
-
-    let read (path : string) = task {
-        let! text = File.ReadAllTextAsync path
-        let deserializer =
-            DeserializerBuilder().IgnoreFields().Build()
-        let cfg = deserializer.Deserialize<ScriptConfig> text
-        return cfg
+        CopypasteScore : Nullable<float>
     }
 
 
-let handleDownload (configPath : string) (dataDirPath : string) : Task = task {
-    let! cfg = Config.read configPath
+    let private deserializer = DeserializerBuilder().IgnoreFields().Build()
+
+    let private readFromFile<'t> (path : string) = task {
+        let! text = File.ReadAllTextAsync path
+        return deserializer.Deserialize<'t> text
+    }
+
+    let private readManyFromFile<'t> (path : string) = task {
+        let! text = File.ReadAllTextAsync path
+        use sr = new StringReader(text)
+        let parser = Parser(sr)
+        let res = List<'t>()
+        let streamStart = parser.Consume<StreamStart>()
+        let mutable docStart = Unchecked.defaultof<DocumentStart>
+        while parser.Accept<DocumentStart>(&docStart) do
+            let item = deserializer.Deserialize<'t>(parser)
+            res.Add item
+        return res.ToArray()
+    }
+
+
+    let readConfig path = readFromFile<ContestConfig> path
+    let readConfig2 path = readManyFromFile<ContestConfig> path
+
+    let readSecret path = readFromFile<Secret> path
+
+
+let handleDownload (secretPath : string) (configPath : string) (dataDirPath : string) : Task = task {
+    let! cfg = Config.readConfig configPath
+    let! secret = Config.readSecret secretPath
 
     Directory.CreateDirectory(dataDirPath) |> ignore
-    do! downloadData dataDirPath { ApiKey = cfg.ApiKey ; ApiSecret = cfg.ApiSecret } cfg.ContestIdList
+    do! downloadData dataDirPath { ApiKey = secret.CodeforcesApiKey ; ApiSecret = secret.CodeforcesApiSecret } cfg.ContestIdList
 }
 
 
-let handleFormat (configPath : string) (dataDirPath : string) (resultPath : string) : Task = task {
-    let! cfg = Config.read configPath
+let handleFormat (configPath : string) (dataDirPath : string) (resultPathFromConfig : string) : Task = task {
+    let! cfg2 = Config.readConfig2 configPath
+    let cfg = cfg2.[0]
+    //let! cfg = Config.readConfig configPath
 
     let! contests = readData dataDirPath cfg.ContestIdList
     validateData cfg.ContestantIdList contests
@@ -421,6 +451,11 @@ let handleFormat (configPath : string) (dataDirPath : string) (resultPath : stri
         CopypasteScore = cfg.CopypasteScore.GetValueOrDefault -1.0
     }
 
+    let resultPath =
+        match resultPathFromConfig with
+        | s when String.IsNullOrWhiteSpace s -> $"result-{cfg.TableId}.txt"
+        | s -> s
+
     use writer = File.CreateText resultPath
     do! writer.WriteLineAsync(formatHeader ctx contests)
     for index, contestantId in Seq.indexed cfg.ContestantIdList do
@@ -431,7 +466,7 @@ let handleFormat (configPath : string) (dataDirPath : string) (resultPath : stri
 
 
 let handleDraftCopypaste (configPath : string) (dataDirPath : string) : Task = task {
-    let! cfg = Config.read configPath
+    let! cfg = Config.readConfig configPath
     let resultPath = "copypaste-draft.md"
 
     let! contests = readData dataDirPath cfg.ContestIdList
@@ -446,6 +481,9 @@ let handleDraftCopypaste (configPath : string) (dataDirPath : string) : Task = t
 
 
 let prepareRootCommand () =
+    let secretPathOption = Option<string>("--secrets", "Path to Codeforces API credentials", IsRequired = false)
+    secretPathOption.SetDefaultValue "secret.yaml"
+
     let configPathOption = Option<string>("--config", "Path to YAML config", IsRequired = false)
     configPathOption.SetDefaultValue "config.yaml"
 
@@ -453,10 +491,10 @@ let prepareRootCommand () =
     dataDirPathOption.SetDefaultValue "data"
 
     let resultPathOption = Option<string>("--result", "Path to result file", IsRequired = false)
-    resultPathOption.SetDefaultValue "result.txt"
 
     let downloadCommand = Command("download", "Download standings JSONs")
-    downloadCommand.SetHandler(handleDownload, configPathOption, dataDirPathOption)
+    downloadCommand.AddOption secretPathOption
+    downloadCommand.SetHandler(handleDownload, secretPathOption, configPathOption, dataDirPathOption)
 
     let formatCommand = Command("format", "Format result from downloaded JSONs")
     formatCommand.AddOption resultPathOption
