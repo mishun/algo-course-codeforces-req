@@ -8,6 +8,7 @@ open System.IO
 open System.Net.Http
 open System.Text
 open System.Text.Json
+open System.Text.RegularExpressions
 open System.Threading.Tasks
 
 
@@ -147,7 +148,7 @@ let printInfo (msg : string) =
     Console.Error.WriteLine msg
 
 
-let validateData (listOfAllContestants : string[]) (contests : CodeforcesApi.StandingsResult seq) =
+let validateData (problemIndexRegex : Regex) (listOfAllContestants : string[]) (contests : CodeforcesApi.StandingsResult seq) =
     let contestantLookup = HashSet listOfAllContestants
 
     let mutable totalNumberOfProblems = 0
@@ -162,7 +163,7 @@ let validateData (listOfAllContestants : string[]) (contests : CodeforcesApi.Sta
                         for m in row.Party.Members do
                             sb.Append(if first then "" else ", ").Append(m.Handle) |> ignore
                             first <- false
-                    sb.Append("}:") |> ignore
+                    sb.Append "}:" |> ignore
                     sb.ToString()
 
             if row.Party.IsGhost then
@@ -178,18 +179,18 @@ let validateData (listOfAllContestants : string[]) (contests : CodeforcesApi.Sta
                 for problemIndex, res in Seq.indexed row.ProblemResults do
                     if res.Points > 0.0 then
                         isUntested.[problemIndex] <- false
-            | _ ->
-                if row.Party.Members.Length <> 1 then
-                    printWarn $"{msgPrefix.Value} isn't single participant"
-                elif not (contestantLookup.Contains row.Party.Members.[0].Handle) then
-                    printWarn $"{msgPrefix.Value} isn't in list of contestants"
+            | _ when row.Party.Members.Length <> 1 ->
+                printWarn $"{msgPrefix.Value} isn't single participant"
+            | _ when not (contestantLookup.Contains row.Party.Members.[0].Handle) ->
+                printWarn $"{msgPrefix.Value} isn't in list of contestants"
+            | _ -> do ()
 
         for problemIndex, problem in Seq.indexed contest.Problems do
             let msgPrefix = lazy $"At '{contest.Contest.Id}/{problem.Index}':"
 
             totalNumberOfProblems <- totalNumberOfProblems + 1
-            if not (problem.Index.EndsWith ".1" || problem.Index.EndsWith ".2" || problem.Index.EndsWith ".3") then
-                printError $"{msgPrefix.Value} problem index is supposed to end with '.1', '.2' or '.3'"
+            if problemIndexRegex.IsMatch problem.Index |> not then
+                printError $"{msgPrefix.Value} problem index '{problem.Index}' doesn't match '{problemIndexRegex}'"
             if isUntested.[problemIndex] then
                 printWarn $"{msgPrefix.Value} problem isn't tested by contest manager"
 
@@ -200,6 +201,8 @@ type Context = {
     BaseRow : int
     BaseCol : int
     CopypasteScore : float
+    UpsolvabeRegex : Regex
+    CountedInLimitRegex : Regex
 }
 
 
@@ -225,7 +228,7 @@ let formatCell (absRow : bool) row col =
 let formatTotalScoreExpr (baseCol : int) (row : int) (contests : CodeforcesApi.StandingsResult seq) =
     let totalScoreExpr = StringBuilder()
     let mutable currentCol = baseCol
-    for i, (contest: CodeforcesApi.StandingsResult) in Seq.indexed contests do
+    for i, contest in Seq.indexed contests do
         currentCol <- currentCol + 2 + contest.Problems.Length
         totalScoreExpr
             .Append(if i > 0 then ", " else "=SUM(")
@@ -251,7 +254,7 @@ let formatHeader (ctx : Context) (contests : CodeforcesApi.StandingsResult seq) 
             l1.Append $"\t{(if i = 0 then contest.Contest.Name else String.Empty)}" |> ignore
             l2.Append $"\t{p.Index}" |> ignore
 
-        let expected = contest.Problems |> Array.sumBy (fun p -> if p.Index.EndsWith ".1" || p.Index.EndsWith ".2" then 1 else 0)
+        let expected = contest.Problems |> Array.sumBy (fun p -> if ctx.CountedInLimitRegex.IsMatch p.Index then 1 else 0)
         l1.Append "\t∑" |> ignore
         l2.Append $"\t{expected}" |> ignore
     $"{l1}\n{l2}"
@@ -295,14 +298,13 @@ with
 let formatLine (ctx : Context) (lineIndex : int) (contestantId : string) (contests : CodeforcesApi.StandingsResult seq) (taintedProblems : HashSet<string>) =
     let tableRow = ctx.BaseRow + 2 + lineIndex
 
-    let isUpsolvable (problem : CodeforcesApi.Problem) =
-        problem.Index.EndsWith ".1" |> not
-
     let sb = StringBuilder()
     let mutable currentCol = ctx.BaseCol + 2
     let mutable problemsAvailable = 0
     let mutable problemsScored = 0
     for contest in contests do
+        let isUpsolvable = [| for p in contest.Problems -> ctx.UpsolvabeRegex.IsMatch p.Index |]
+
         let markers = [|
             for p in contest.Problems ->
                 Marker.Initial(taintedProblems.Contains $"{contest.Contest.Id}/{p.Index}")
@@ -316,9 +318,9 @@ let formatLine (ctx : Context) (lineIndex : int) (contestantId : string) (contes
                         Marker.UpdateWith(&markers.[index], result, false)
 
                 | CodeforcesApi.ParticipantType.PRACTICE ->
-                    for index, result in Seq.indexed ranklistRow.ProblemResults do
-                        if isUpsolvable contest.Problems.[index] then
-                            Marker.UpdateWith(&markers.[index], result, true)
+                    for problemIndex, result in Seq.indexed ranklistRow.ProblemResults do
+                        if isUpsolvable.[problemIndex] then
+                            Marker.UpdateWith(&markers.[problemIndex], result, true)
 
                 | _ -> ()
 
@@ -373,7 +375,7 @@ module Config =
     open YamlDotNet.Serialization
 
     [<CLIMutable>]
-    type Secret = {
+    type CodeforcesApiSecret = {
         [<YamlMember(Alias = "codeforces-api-key")>]
         CodeforcesApiKey : string
 
@@ -424,7 +426,7 @@ module Config =
     let readConfig path = readFromFile<ContestConfig> path
     let readConfig2 path = readManyFromFile<ContestConfig> path
 
-    let readSecret path = readFromFile<Secret> path
+    let readSecret path = readFromFile<CodeforcesApiSecret> path
 
 
 let handleDownload (secretPath : string) (configPath : string) (dataDirPath : string) : Task = task {
@@ -442,13 +444,16 @@ let handleFormat (configPath : string) (dataDirPath : string) (resultPathFromCon
     //let! cfg = Config.readConfig configPath
 
     let! contests = readData dataDirPath cfg.ContestIdList
-    validateData cfg.ContestantIdList contests
+    let problemIndexRegex = Regex @"[A-Z]+\.[1-3]"
+    validateData problemIndexRegex cfg.ContestantIdList contests
     let copypastes = prapareCopypastes cfg.ContestantIdList contests cfg.Copypastes
 
     let ctx = {
         BaseRow = 0
         BaseCol = 2
         CopypasteScore = cfg.CopypasteScore.GetValueOrDefault -1.0
+        UpsolvabeRegex = Regex @"[A-Z]+\.[2-3]"
+        CountedInLimitRegex = Regex @"[A-Z]+\.[1-2]"
     }
 
     let resultPath =
